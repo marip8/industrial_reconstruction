@@ -123,6 +123,7 @@ class ArchivePlayer(Node):
         global publishing
         self.publishing = True
 
+        res.success = True
         return res
 
 
@@ -130,6 +131,7 @@ class ArchivePlayer(Node):
         global publishing
         self.publishing = False
 
+        res.success = True
         return res
 
 
@@ -137,6 +139,7 @@ class ArchivePlayer(Node):
         global publishing, current_index
         current_index = 0
 
+        res.success = True
         return res
 
     def timerCallback(self):
