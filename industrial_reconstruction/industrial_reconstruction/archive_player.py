@@ -134,6 +134,7 @@ class ArchivePlayer(Node):
         self.publishing = True
         res.success = True
 
+        res.success = True
         return res
 
 
@@ -142,6 +143,7 @@ class ArchivePlayer(Node):
         self.publishing = False
         res.success = True
 
+        res.success = True
         return res
 
 
@@ -150,6 +152,7 @@ class ArchivePlayer(Node):
         current_index = 0
         res.success = True
 
+        res.success = True
         return res
 
     def timerCallback(self):
