@@ -1,0 +1,412 @@
+#! /usr/bin/env python3
+# Copyright 2022 Southwest Research Institute
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import asyncio
+from cv_bridge import CvBridge
+from geometry_msgs.msg import TransformStamped, Point
+from industrial_reconstruction_msgs.srv import StartReconstruction, StopReconstruction
+from message_filters import ApproximateTimeSynchronizer, Subscriber
+import numpy as np
+import open3d as o3d
+import rclpy
+from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy, DurabilityPolicy
+from rclpy.node import Node
+from scipy.spatial.transform import Rotation
+from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import ColorRGBA
+from tf2_ros.buffer import Buffer
+from tf2_ros import TransformListener
+from visualization_msgs.msg import Marker
+
+
+def from_transform_msg(msg: TransformStamped) -> np.ndarray:
+    """
+
+    """
+    pose = np.eye(4)
+    pose[0, 3] = msg.transform.translation.x
+    pose[1, 3] = msg.transform.translation.y
+    pose[2, 3] = msg.transform.translation.z
+    q = Rotation.from_quat([
+        msg.transform.rotation.w,
+        msg.transform.rotation.x,
+        msg.transform.rotation.y,
+        msg.transform.rotation.z,
+    ])
+    pose[:3, :3] = q.as_matrix()
+    return pose
+
+
+def filter_normals(mesh: o3d.geometry.TriangleMesh,
+                   direction: np.ndarray,
+                   angle: float) -> o3d.geometry.TriangleMesh:
+    """
+
+    """
+    mesh.compute_vertex_normals()
+    tri_normals = np.asarray(mesh.triangle_normals)
+    dot_prods = tri_normals @ direction
+    mesh.remove_triangles_by_mask(dot_prods < np.cos(angle))
+    return mesh
+
+
+def process_mesh(mesh: o3d.geometry.TriangleMesh,
+                 crop_box: o3d.geometry.AxisAlignedBoundingBox,
+                 normal_filters: list = (),
+                 min_faces: int = 1) -> o3d.geometry.TriangleMesh:
+    """
+
+    """
+    # Compute normals
+    mesh.compute_vertex_normals()
+
+    # Crop to the TSDF volume
+    cropped_mesh = mesh.crop(crop_box)
+
+    # Mesh filtering
+    for f in normal_filters:
+        n = np.array([
+            f.normal_direction.x,
+            f.normal_direction.y,
+            f.normal_direction.z
+        ])
+        cropped_mesh = filter_normals(cropped_mesh, np.atleast_2d(n), np.radians(f.angle))
+
+    # Connected components
+    triangle_clusters, cluster_n_triangles, _ = cropped_mesh.cluster_connected_triangles()
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+
+    triangles_to_remove = cluster_n_triangles[triangle_clusters] < min_faces
+    cropped_mesh.remove_triangles_by_mask(triangles_to_remove)
+    cropped_mesh.remove_unreferenced_vertices()
+
+    return cropped_mesh
+
+
+def to_mesh_msg(mesh: o3d.geometry.TriangleMesh) -> Marker:
+    """
+
+    """
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    vertex_colors = np.asarray(mesh.vertex_colors)
+    msg = Marker()
+    msg.type = Marker.TRIANGLE_LIST
+    msg.action = Marker.ADD
+    msg.id = 1
+    msg.scale.x = 1.0
+    msg.scale.y = 1.0
+    msg.scale.z = 1.0
+    msg.pose.position.x = 0.0
+    msg.pose.position.y = 0.0
+    msg.pose.position.z = 0.0
+    msg.pose.orientation.w = 1.0
+    msg.pose.orientation.x = 0.0
+    msg.pose.orientation.y = 0.0
+    msg.pose.orientation.z = 0.0
+    for triangle in triangles:
+        for vertex_index in triangle:
+            curr_point = Point()
+            curr_point.x = vertices[vertex_index][0]
+            curr_point.y = vertices[vertex_index][1]
+            curr_point.z = vertices[vertex_index][2]
+            curr_point_color = ColorRGBA()
+            curr_point_color.r = vertex_colors[vertex_index][0]
+            curr_point_color.g = vertex_colors[vertex_index][1]
+            curr_point_color.b = vertex_colors[vertex_index][2]
+            curr_point_color.a = 1.0
+            msg.points.append(curr_point)
+            msg.colors.append(curr_point_color)
+    return msg
+
+
+def from_camera_info_msg(camera_info_msg: CameraInfo) -> o3d.camera.PinholeCameraIntrinsic:
+    """
+
+    """
+    return o3d.camera.PinholeCameraIntrinsic(
+      width=camera_info_msg.width,
+      height=camera_info_msg.height,
+      fx=camera_info_msg.k[0],
+      fy=camera_info_msg.k[4],
+      cx=camera_info_msg.k[2],
+      cy=camera_info_msg.k[5]
+    )
+
+
+class IndustrialReconstruction(Node):
+    """
+
+    """
+
+    def __init__(self):
+        """
+
+        """
+        super().__init__('industrial_reconstruction')
+
+        # TSDF volume
+        self.tsdf_volume = None
+
+        # Flag
+        self.active = False
+
+        # TF
+        self.buffer = Buffer()
+        self.tf_listener = TransformListener(buffer=self.buffer, node=self)
+
+        # CV bridge for image conversion
+        self.bridge = CvBridge()
+
+        # Parameters
+        # self.declare_parameter('tracking_frame', '')
+        # self.declare_parameter('relative_frame', '')
+        self.declare_parameter("cache_count", 10)
+        self.declare_parameter("slop", 0.01)
+        # self.declare_parameter('voxel_length', 0.01)
+        # self.declare_parameter('sdf_trunc', 0.02)
+        # self.declare_parameter('min_x', -np.inf)
+        # self.declare_parameter('min_y', -np.inf)
+        # self.declare_parameter('min_z', -np.inf)
+        # self.declare_parameter('max_x', np.inf)
+        # self.declare_parameter('max_x', np.inf)
+        # self.declare_parameter('max_x', np.inf)
+        # self.declare_parameter('depth_scale', 1000.0)
+        # self.declare_parameter('depth_trunc', 3.0)
+
+        self.reference_frame = ''
+        self.camera_frame = ''
+        self.cache_count = int(self.get_parameter('cache_count').value)
+        self.slop = float(self.get_parameter('slop').value)
+        self.depth_scale = None
+        self.depth_trunc = None
+        self.convert_rgb_to_intensity = False
+        self.crop_box = o3d.geometry.AxisAlignedBoundingBox(
+            max_bound=np.full((3,), fill_value=np.inf),
+            min_bound=np.negative(np.full((3,), fill_value=np.inf))
+        )
+
+        # Subscriptions
+        sub_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_ALL,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+
+        self.depth_sub = Subscriber(self, Image, 'depth_image', qos_profile=sub_qos)
+        self.color_sub = Subscriber(self, Image, 'color_image', qos_profile=sub_qos)
+        self.info_sub = Subscriber(self, CameraInfo, 'camera_info', qos_profile=sub_qos)
+        self.tss = ApproximateTimeSynchronizer(
+            [
+                self.depth_sub,
+                self.color_sub,
+                self.info_sub
+            ],
+            self.cache_count,
+            self.slop,
+            False
+        )
+        self.tss.registerCallback(self.image_callback)
+
+        # Publisher
+        pub_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_ALL,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.mesh_pub = self.create_publisher(Marker, "reconstruction", pub_qos)
+        self.tsdf_volume_pub = self.create_publisher(Marker, "tsdf_volume", pub_qos)
+
+        # Services
+        self.start_server = self.create_service(
+            StartReconstruction,
+            'start_reconstruction',
+            self.start_reconstruction_callback
+        )
+        self.stop_server = self.create_service(
+            StopReconstruction,
+            'stop_reconstruction',
+            self.stop_reconstruction_callback
+        )
+
+    def publish_crop_box(self):
+        """
+
+        """
+        extent = self.crop_box.get_max_bound() - self.crop_box.get_min_bound()
+        center = (self.crop_box.get_min_bound() + self.crop_box.get_max_bound()) / 2.0
+
+        crop_box_msg = Marker()
+        crop_box_msg.type = Marker.CUBE
+        crop_box_msg.action = Marker.ADD
+        crop_box_msg.id = 1
+        crop_box_msg.scale.x = extent[0]
+        crop_box_msg.scale.y = extent[1]
+        crop_box_msg.scale.z = extent[2]
+        crop_box_msg.pose.position.x = center[0]
+        crop_box_msg.pose.position.y = center[1]
+        crop_box_msg.pose.position.z = center[2]
+        crop_box_msg.pose.orientation.w = 1.0
+        crop_box_msg.pose.orientation.x = 0.0
+        crop_box_msg.pose.orientation.y = 0.0
+        crop_box_msg.pose.orientation.z = 0.0
+        crop_box_msg.color.r = 1.0
+        crop_box_msg.color.g = 0.0
+        crop_box_msg.color.b = 0.0
+        crop_box_msg.color.a = 0.25
+        crop_box_msg.header.frame_id = self.reference_frame
+
+        self.tsdf_volume_pub.publish(crop_box_msg)
+
+    def publish_mesh(self, mesh: o3d.geometry.TriangleMesh):
+        """
+
+        """
+        mesh_msg = to_mesh_msg(mesh)
+        mesh_msg.header.stamp = self.get_clock().now().to_msg()
+        mesh_msg.header.frame_id = self.reference_frame
+        self.mesh_pub.publish(mesh_msg)
+
+    def start_reconstruction_callback(self,
+                                      req: StartReconstruction.Request,
+                                      res: StartReconstruction.Response):
+        """
+
+        """
+        self.get_logger().info(" Start Reconstruction")
+
+        # Create the crop box
+        min_bound = np.asarray([
+            req.tsdf_params.min_box_values.x,
+            req.tsdf_params.min_box_values.y,
+            req.tsdf_params.min_box_values.z
+        ])
+        max_bound = np.asarray([
+            req.tsdf_params.max_box_values.x,
+            req.tsdf_params.max_box_values.y,
+            req.tsdf_params.max_box_values.z
+        ])
+        self.crop_box = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
+
+        # Publish
+        self.publish_crop_box()
+
+        # Initialize the TSDF volume
+        self.tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=req.tsdf_params.voxel_length,
+            sdf_trunc=req.tsdf_params.sdf_trunc,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+        )
+
+        self.depth_scale = req.rgbd_params.depth_scale
+        self.depth_trunc = req.rgbd_params.depth_trunc
+        self.convert_rgb_to_intensity = req.rgbd_params.convert_rgb_to_intensity
+        self.camera_frame = req.camera_frame
+        self.reference_frame = req.reference_frame
+
+        self.active = True
+
+        res.success = True
+        return res
+
+    def stop_reconstruction_callback(self,
+                                     req: StopReconstruction.Request,
+                                     res: StopReconstruction.Response):
+        """
+
+        """
+        self.active = False
+
+        if self.tsdf_volume is None:
+            res.success = False
+            res.message = "Start reconstruction hasn't been called yet"
+            return res
+
+        # Await the end of the integration process
+        asyncio.gather()
+
+        # Extract the mesh
+        mesh = process_mesh(
+            mesh=self.tsdf_volume.extract_triangle_mesh(),
+            crop_box=self.crop_box,
+            normal_filters=req.normal_filters,
+            min_faces=req.min_num_faces
+        )
+
+        # Write the mesh to file
+        o3d.io.write_triangle_mesh(req.mesh_filepath, mesh, False, True)
+
+        res.success = True
+        res.message = "Saved mesh to " + req.mesh_filepath
+        return res
+
+    async def image_callback(self,
+                             depth_image_msg: Image,
+                             rgb_image_msg: Image,
+                             camera_info_msg: CameraInfo):
+        """
+
+        """
+        if not self.active:
+            return
+
+        # Convert depth image message to Open3D
+        depth = o3d.geometry.Image(
+            self.bridge.imgmsg_to_cv2(
+                depth_image_msg,
+                "16UC1")
+        )
+
+        # Convert the color image to Open3D
+        color = o3d.geometry.Image(
+            self.bridge.imgmsg_to_cv2(
+                rgb_image_msg,
+                rgb_image_msg.encoding
+            )
+        )
+
+        # Convert camera info
+        intrinsics = from_camera_info_msg(camera_info_msg)
+
+        # Lookup the transform from the relative frame to the tracking frame
+        ref_to_camera_msg = self.buffer.lookup_transform(self.reference_frame, self.camera_frame, depth_image_msg.header.stamp)
+        ref_to_camera = from_transform_msg(ref_to_camera_msg)
+
+        # Create the RGBD image
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color=color,
+            depth=depth,
+            depth_scale=self.depth_scale,
+            depth_trunc=self.depth_trunc,
+            convert_rgb_to_intensity=False
+        )
+
+        self.tsdf_volume.integrate(rgbd, intrinsics, np.linalg.inv(ref_to_camera))
+
+        # TODO: Publish the mesh somewhat frequently
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = IndustrialReconstruction()
+    node.get_logger().info('Started industrial reconstruction node')
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
